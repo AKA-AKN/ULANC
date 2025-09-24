@@ -1,4 +1,4 @@
-# client.py
+# client.py (Final Architecture - Solves Race Condition)
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -18,115 +18,127 @@ logging.basicConfig(level=logging.INFO)
 # --- U-LANC Video Processing Logic ---
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=0)
+received_frames = {}
 
-# Define blur kernels for different quality levels
-QUALITY_LEVELS = {
-    "high": (21, 21),   # Low blur for good networks
-    "medium": (61, 61), # Medium blur
-    "low": (101, 101)   # Heavy blur for poor networks
-}
-
-class UlanCVideoTrack(MediaStreamTrack):
+class QueuedVideoStreamTrack(MediaStreamTrack):
     """
-    A video track that applies the U-LANC adaptive compression effect.
+    A video track that reads frames from an asyncio.Queue.
     """
     kind = "video"
-
-    def __init__(self, track):
+    def __init__(self, queue):
         super().__init__()
-        self.track = track
-        self.current_quality = "high" # Start with high quality
+        self.queue = queue
 
     async def recv(self):
-        frame = await self.track.recv()
-        img = frame.to_ndarray(format="bgr24")
+        # Get the next frame from the queue
+        frame = await self.queue.get()
+        return frame
 
-        # --- Adaptive Compression Logic ---
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = segmentation.process(rgb_img)
-        mask = results.segmentation_mask
-        condition = np.stack((mask,) * 3, axis=-1) > 0.1
-
-        kernel = QUALITY_LEVELS[self.current_quality]
-        blurred_background = cv2.GaussianBlur(img, kernel, 0)
-
-        output_img = np.where(condition, img, blurred_background)
-        # --- End of Logic ---
-
-        # Rebuild the video frame
-        new_frame = VideoFrame.from_ndarray(output_img, format="bgr24")
-        new_frame.pts = frame.pts
-        new_frame.time_base = frame.time_base
-        return new_frame
-
-async def monitor_network(pc, video_track):
+async def video_processor(camera_track, face_queue, background_queue, shared_state):
     """
-    Monitors the network stats and updates the video quality.
+    A central coroutine that reads from the camera, runs segmentation ONCE,
+    and puts the processed frames into their respective queues.
     """
     while True:
-        await asyncio.sleep(5) # Check every 5 seconds
+        frame = await camera_track.recv()
+        img = frame.to_ndarray(format="bgr24")
+
+        # --- Run expensive AI model only ONCE per frame ---
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = segmentation.process(rgb_img)
+        condition = np.stack((results.segmentation_mask,) * 3, axis=-1) > 0.1
+
+        # --- Create the Face Frame ---
+        green_screen = np.zeros_like(img)
+        green_screen[:] = (0, 255, 0) # BGR for green
+        face_img = np.where(condition, img, green_screen)
+        face_frame = VideoFrame.from_ndarray(face_img, format="bgr24")
+        face_frame.pts, face_frame.time_base = frame.pts, frame.time_base
+        
+        # --- Create the Background Frame based on network quality ---
+        if shared_state["quality"] == "high":
+            black_silhoutte = np.zeros_like(img)
+            background_img = np.where(condition, black_silhoutte, img)
+        else: # low quality
+            background_img = cv2.GaussianBlur(img, (99, 99), 0)
+        
+        background_frame = VideoFrame.from_ndarray(background_img, format="bgr24")
+        background_frame.pts, background_frame.time_base = frame.pts, frame.time_base
+
+        # --- Push frames to their queues for sending ---
+        if not face_queue.full():
+            await face_queue.put(face_frame)
+        if not background_queue.full():
+            await background_queue.put(background_frame)
+
+async def monitor_network(pc, shared_state):
+    """
+    Monitors network stats and updates the shared state.
+    """
+    while True:
+        await asyncio.sleep(5)
         try:
             stats = await pc.getStats()
             for report in stats.values():
                 if report["type"] == "candidate-pair" and report.get("state") == "succeeded":
                     available_bitrate = report.get("availableOutgoingBitrate")
                     if available_bitrate:
-                        if available_bitrate > 1_000_000: # > 1 Mbps
-                            if video_track.current_quality != "high":
-                                logging.info("Network is GOOD. Setting quality to HIGH.")
-                                video_track.current_quality = "high"
-                        elif available_bitrate < 400_000: # < 400 Kbps
-                            if video_track.current_quality != "low":
-                                logging.info("Network is POOR. Setting quality to LOW.")
-                                video_track.current_quality = "low"
+                        if available_bitrate > 800_000:
+                            if shared_state["quality"] != "high":
+                                logging.info("Network is GOOD. Sending clear background.")
+                                shared_state["quality"] = "high"
                         else:
-                            if video_track.current_quality != "medium":
-                                logging.info("Network is OK. Setting quality to MEDIUM.")
-                                video_track.current_quality = "medium"
+                            if shared_state["quality"] != "low":
+                                logging.info("Network is POOR. Sending lossy (blurred) background.")
+                                shared_state["quality"] = "low"
         except Exception as e:
             logging.error(f"Error getting stats: {e}")
 
-
 async def run(pc, role, signaling_server):
-    """
-    Main function to run the WebRTC client.
-    """
     session = ClientSession()
 
     @pc.on("track")
     def on_track(track):
-        logging.info(f"Track {track.kind} received")
-        # Display the received video
-        async def display_track():
+        logging.info(f"Track {track.kind} received, id={track.id}")
+        received_frames[track.id] = None
+        @track.on("ended")
+        async def on_ended():
+            logging.info(f"Track {track.id} ended")
+            if track.id in received_frames: del received_frames[track.id]
+        async def process_track():
             while True:
-                frame = await track.recv()
-                img = frame.to_ndarray(format="bgr24")
-                cv2.imshow("Received Video", img)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                try:
+                    frame = await track.recv()
+                    received_frames[track.id] = frame.to_ndarray(format="bgr24")
+                except Exception:
+                    if track.id in received_frames: del received_frames[track.id]
                     break
-        asyncio.ensure_future(display_track())
+        asyncio.ensure_future(process_track())
 
     if role == "send":
-        # Create a video source from the webcam
         from aiortc.contrib.media import MediaPlayer
         player = MediaPlayer("video=Integrated Camera", format="dshow", options={"video_size": "640x480"})
+
+        # Create queues and shared state
+        shared_state = {"quality": "high"}
+        face_queue = asyncio.Queue(maxsize=1)
+        background_queue = asyncio.Queue(maxsize=1)
         
-        # Create the adaptive video track and add it to the peer connection
-        video_track = UlanCVideoTrack(player.video)
-        pc.addTrack(video_track)
+        # Create tracks that read from queues
+        face_track = QueuedVideoStreamTrack(face_queue)
+        background_track = QueuedVideoStreamTrack(background_queue)
+        pc.addTrack(face_track)
+        pc.addTrack(background_track)
 
-        # Start the network monitor
-        asyncio.ensure_future(monitor_network(pc, video_track))
+        # Start the central processor and network monitor
+        asyncio.ensure_future(video_processor(player.video, face_queue, background_queue, shared_state))
+        asyncio.ensure_future(monitor_network(pc, shared_state))
 
-        # Create offer
+        # Standard signaling
         await pc.setLocalDescription(await pc.createOffer())
         offer = {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-        
-        # Send offer to signaling server
         async with session.post(f"{signaling_server}/offer", json=offer) as resp:
             logging.info(f"Offer sent, server responded with {await resp.text()}")
-
-        # Wait for answer
         while True:
             logging.info("Waiting for answer...")
             await asyncio.sleep(2)
@@ -139,7 +151,6 @@ async def run(pc, role, signaling_server):
                         logging.info("Answer received and connection established.")
                         break
     else: # Role is "receive"
-        # Wait for offer
         while True:
             logging.info("Waiting for offer...")
             await asyncio.sleep(2)
@@ -149,17 +160,39 @@ async def run(pc, role, signaling_server):
                     if offer_json:
                         offer = RTCSessionDescription(sdp=offer_json["sdp"], type=offer_json["type"])
                         await pc.setRemoteDescription(offer)
-                        
-                        # Create answer
                         await pc.setLocalDescription(await pc.createAnswer())
                         answer = {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-
-                        # Send answer to signaling server
                         async with session.post(f"{signaling_server}/answer", json=answer) as resp_post:
                             logging.info(f"Answer sent, server responded with {await resp_post.text()}")
+                        
+                        async def display_composited_video():
+                            while True:
+                                await asyncio.sleep(1/30)
+                                frames = [f for f in received_frames.values() if f is not None]
+                                if len(frames) < 2:
+                                    if len(frames) == 1: cv2.imshow("Received Video", frames[0])
+                                    if cv2.waitKey(1) & 0xFF == ord('q'): break
+                                    continue
+
+                                face_frame, background_frame = None, None
+                                green_pixels_0 = np.count_nonzero(cv2.inRange(frames[0], np.array([0, 250, 0]), np.array([5, 255, 5])))
+                                green_pixels_1 = np.count_nonzero(cv2.inRange(frames[1], np.array([0, 250, 0]), np.array([5, 255, 5])))
+                                if green_pixels_0 > green_pixels_1:
+                                    face_frame, background_frame = frames[0], frames[1]
+                                else:
+                                    face_frame, background_frame = frames[1], frames[0]
+
+                                mask = cv2.inRange(face_frame, np.array([0, 250, 0]), np.array([5, 255, 5]))
+                                mask_inv = cv2.bitwise_not(mask)
+                                fg = cv2.bitwise_and(face_frame, face_frame, mask=mask_inv)
+                                bg = cv2.bitwise_and(background_frame, background_frame, mask=mask)
+                                final_frame = cv2.add(bg, fg)
+
+                                cv2.imshow("Received Video", final_frame)
+                                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                        asyncio.ensure_future(display_composited_video())
                         break
-    
-    # Keep the application running
+
     try:
         await asyncio.Event().wait()
     finally:
@@ -172,7 +205,6 @@ if __name__ == "__main__":
     parser.add_argument("role", choices=["send", "receive"])
     parser.add_argument("--server", default="http://127.0.0.1:8080", help="Signaling server URL")
     args = parser.parse_args()
-
     pc = RTCPeerConnection()
     try:
         asyncio.run(run(pc, args.role, args.server))
