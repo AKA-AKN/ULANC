@@ -109,7 +109,7 @@ async def run(pc, role, signaling_server):
     if role == "send":
         # Create a video source from the webcam
         from aiortc.contrib.media import MediaPlayer
-        player = MediaPlayer("video=default", format="v4l2", options={"video_size": "640x480"}) # Use a different option for Windows if needed
+        player = MediaPlayer("video=Integrated Camera", format="dshow", options={"video_size": "640x480"})
         
         # Create the adaptive video track and add it to the peer connection
         video_track = UlanCVideoTrack(player.video)
@@ -180,4 +180,3 @@ if __name__ == "__main__":
         pass
     finally:
         cv2.destroyAllWindows()
-        
