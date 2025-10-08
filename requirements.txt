@@ -1,7 +1,0 @@
-# requirements.txt
-opencv-python
-mediapipe
-numpy
-aiortc
-aiohttp
-aiohttp-cors
