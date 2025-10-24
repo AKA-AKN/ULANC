@@ -1,7 +1,5 @@
-# requirements.txt
+aiohttp
 opencv-python
 mediapipe
 numpy
-aiortc
-aiohttp
-aiohttp-cors
+speedtest-cli

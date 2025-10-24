@@ -21,3 +21,5 @@ __pycache__/
 # If your application generates log files, they should be ignored
 # as they are runtime artifacts, not source code.
 *.log
+.env
+Future

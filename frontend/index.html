@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ULANC vs Normal ABR Comparison</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #121212; 
+            color: #e0e0e0;
+            margin: 0;
+            padding: 20px;
+        }
+        h1, h2 { text-align: center; color: #ffffff; }
+       .container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+       .stream-box {
+            border: 2px solid #444;
+            border-radius: 8px;
+            padding: 15px;
+            background-color: #1e1e1e;
+            text-align: center;
+            min-width: 320px;
+        }
+        img {
+            background-color: #000;
+            border-radius: 4px;
+            width: 100%;
+            max-width: 640px;
+            min-height: 180px;
+        }
+       .status-bar {
+            text-align: center;
+            margin: 20px auto;
+            padding: 15px;
+            background-color: #2a2a2a;
+            border-radius: 8px;
+            max-width: 800px;
+            font-size: 1.2em;
+        }
+       .status-bar span {
+            font-weight: bold;
+            color: #4caf50;
+        }
+    </style>
+</head>
+<body>
+    <h1>ULANC vs. Normal ABR - Live Comparison</h1>
+    <div class="status-bar">
+        Measured Upload Speed: <span id="speed">N/A</span> Mbps | 
+        Applied Quality Level: <span id="quality">HIGH</span>
+    </div>
+    <div class="container">
+        <div class="stream-box">
+            <h2>ULANC Stream (Your Method)</h2>
+            <img id="ulanc_stream" src="" alt="ULANC Stream">
+        </div>
+        <div class="stream-box">
+            <h2>Normal Stream (Standard ABR)</h2>
+            <img id="normal_stream" src="" alt="Normal Stream">
+        </div>
+    </div>
+
+    <script>
+        const ulancImg = document.getElementById('ulanc_stream');
+        const normalImg = document.getElementById('normal_stream');
+        const speedEl = document.getElementById('speed');
+        const qualityEl = document.getElementById('quality');
+
+        // Determine the correct WebSocket protocol
+        const wsProtocol = window.location.protocol === 'https:'? 'wss://' : 'ws://';
+
+        function setupWebSocket(streamType, imgElement) {
+            const wsUrl = `${wsProtocol}${window.location.host}/ws/${streamType}`;
+            console.log(`Connecting to ${wsUrl}`); // For debugging
+            const ws = new WebSocket(wsUrl);
+            ws.binaryType = 'blob';
+
+            ws.onopen = () => console.log(`${streamType} WebSocket connected`);
+            ws.onmessage = (event) => {
+                // Revoke the old URL to prevent memory leaks before creating a new one
+                if (imgElement.src) {
+                    URL.revokeObjectURL(imgElement.src);
+                }
+                const url = URL.createObjectURL(event.data);
+                imgElement.src = url;
+            };
+            ws.onerror = (error) => console.error(`${streamType} WebSocket Error:`, error);
+            ws.onclose = () => {
+                console.log(`${streamType} WebSocket disconnected. Reconnecting in 3 seconds...`);
+                imgElement.src = ""; // Clear the image on disconnect
+                setTimeout(() => setupWebSocket(streamType, imgElement), 3000);
+            };
+        }
+
+        function pollStatus() {
+            fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                    speedEl.textContent = data.upload_speed;
+                    qualityEl.textContent = data.quality_level.toUpperCase();
+                })
+            .catch(error => console.error('Error fetching status:', error));
+        }
+
+        // Initialize WebSockets
+        setupWebSocket('ulanc', ulancImg);
+        setupWebSocket('normal', normalImg);
+
+        // Poll for status updates every 5 seconds
+        setInterval(pollStatus, 5000);
+        pollStatus(); // Initial poll
+    </script>
+</body>
+</html>
